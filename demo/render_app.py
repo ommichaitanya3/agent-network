@@ -1,6 +1,6 @@
 """Render deployment: Agent Network platform + five mock company agents."""
 
-import json
+import asyncio
 import os
 import uuid
 from datetime import datetime, timezone
@@ -9,24 +9,25 @@ import httpx
 from fastapi import HTTPException
 from pydantic import BaseModel
 
-# Render provides RENDER_EXTERNAL_URL automatically.
 PUBLIC_URL = os.getenv(
     "RENDER_EXTERNAL_URL",
     f"http://127.0.0.1:{os.getenv('PORT', '8000')}",
 ).rstrip("/")
 
-# Use a persistent disk path if DB_PATH is configured in Render.
 DB = os.getenv("DB_PATH", "live.db")
 os.environ["DB_PATH"] = DB
 
-# Import only after DB_PATH is configured.
+from app.config import Settings
 from app.db import Database
+from app.embeddings import build_embedder, to_blob
 from app.security import hash_key, new_api_key, new_webhook_secret
 from app.main import create_app
 from demo import mock_agents
 from demo.agents import AGENTS
 
-# Mock agents call the public platform URL to post their replies.
+settings = Settings()
+embedder = build_embedder(settings)
+
 mock_agents.PLATFORM_URL = PUBLIC_URL
 
 
@@ -37,12 +38,17 @@ class DemoPost(BaseModel):
 
 
 def prepare_demo_agents():
-    """Create or reuse the five demo companies and their credentials."""
+    """Create five demo agents with valid interest embeddings."""
+
     db = Database(DB)
 
     try:
         for agent in AGENTS:
             company = agent["company_name"]
+
+            # Generate an embedding for the agent's interests.
+            embedding = asyncio.run(embedder.embed(agent["manifesto"]))
+            embedding_blob = to_blob(embedding)
 
             rows = db.query(
                 """
@@ -73,6 +79,7 @@ def prepare_demo_agents():
                     SET industry_category=?,
                         webhook_url=?,
                         interest_manifesto=?,
+                        interest_embedding=?,
                         api_key_hash=?,
                         webhook_secret=?,
                         is_active=1
@@ -82,12 +89,14 @@ def prepare_demo_agents():
                         agent["industry_category"],
                         webhook_url,
                         agent["manifesto"],
+                        embedding_blob,
                         hash_key(api_key),
                         secret,
                         agent_id,
                     ),
                 )
-                print(f"Reused demo company: {company}")
+
+                print(f"Updated demo company: {company}")
 
             else:
                 agent_id = str(uuid.uuid4())
@@ -95,12 +104,18 @@ def prepare_demo_agents():
                 db.execute(
                     """
                     INSERT INTO agents (
-                        id, company_name, industry_category, webhook_url,
-                        interest_manifesto, interest_embedding,
-                        blocked_industries, api_key_hash, webhook_secret,
+                        id,
+                        company_name,
+                        industry_category,
+                        webhook_url,
+                        interest_manifesto,
+                        interest_embedding,
+                        blocked_industries,
+                        api_key_hash,
+                        webhook_secret,
                         created_at
                     )
-                    VALUES (?, ?, ?, ?, ?, NULL, '[]', ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, '[]', ?, ?, ?)
                     """,
                     (
                         agent_id,
@@ -108,11 +123,13 @@ def prepare_demo_agents():
                         agent["industry_category"],
                         webhook_url,
                         agent["manifesto"],
+                        embedding_blob,
                         hash_key(api_key),
                         secret,
                         datetime.now(timezone.utc).isoformat(),
                     ),
                 )
+
                 print(f"Created demo company: {company}")
 
             mock_agents.CREDS[agent["slug"]] = {
@@ -125,11 +142,11 @@ def prepare_demo_agents():
         db.close()
 
 
-# Register demo agents before the API starts.
+# Prepare all five agents before starting the platform.
 prepare_demo_agents()
 
-# Create the main platform.
-app = create_app()
+# Create the main platform using the same settings.
+app = create_app(settings=settings)
 
 
 @app.get("/demo/agents", include_in_schema=False)
@@ -172,9 +189,8 @@ async def demo_publish(body: DemoPost):
     return response.json()
 
 
-# Mount mock-agent webhook routes at the root as a fallback.
-# Existing platform routes are registered first and remain unchanged.
+# Expose the five mock-agent webhook routes on the same Render service.
 app.mount("/", mock_agents.app)
 
 print(f"Agent Network deployment configured for {PUBLIC_URL}")
-print("Five demo companies prepared.")
+print("Five demo companies prepared with interest embeddings.")
